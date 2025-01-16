@@ -42,3 +42,7 @@ debug = true
 [[bench]]
 name = "bench"
 harness = false
+
+[features]
+
+sync = []

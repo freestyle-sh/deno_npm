@@ -20,10 +20,10 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::hash::Hash;
 use std::hash::Hasher;
-use std::rc::Rc;
 use thiserror::Error;
 
 use super::common::NpmPackageVersionResolutionError;
+use crate::arc::MaybeArc;
 use crate::registry::NpmDependencyEntry;
 use crate::registry::NpmDependencyEntryError;
 use crate::registry::NpmDependencyEntryKind;
@@ -93,7 +93,7 @@ enum ResolvedIdPeerDep {
   /// change from under it.
   ParentReference {
     parent: GraphPathNodeOrRoot,
-    child_pkg_nv: Rc<PackageNv>,
+    child_pkg_nv: MaybeArc<PackageNv>,
   },
   /// A node that was created during snapshotting and is not being used in any path.
   SnapshotNodeId(NodeId),
@@ -123,7 +123,7 @@ impl ResolvedIdPeerDep {
 /// will become fully resolved to an `NpmPackageId`.
 #[derive(Clone)]
 struct ResolvedId {
-  nv: Rc<PackageNv>,
+  nv: MaybeArc<PackageNv>,
   peer_dependencies: Vec<ResolvedIdPeerDep>,
 }
 
@@ -199,8 +199,8 @@ impl NodeIdRef {
 
 #[derive(Clone)]
 enum GraphPathNodeOrRoot {
-  Node(Rc<GraphPath>),
-  Root(Rc<PackageNv>),
+  Node(MaybeArc<GraphPath>),
+  Root(MaybeArc<PackageNv>),
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -219,7 +219,7 @@ struct GraphPath {
   specifier: StackString,
   // we could consider not storing this here and instead reference the resolved
   // nodes, but we should performance profile this code first
-  nv: Rc<PackageNv>,
+  nv: MaybeArc<PackageNv>,
   /// Descendants in the path that circularly link to an ancestor in a child. These
   /// descendants should be kept up to date and always point to this node.
   linked_circular_descendants: RefCell<Vec<Rc<GraphPath>>>,
@@ -256,7 +256,7 @@ impl GraphPath {
   }
 
   pub fn with_id(
-    self: &Rc<GraphPath>,
+    self: &MaybeArc<GraphPath>,
     node_id: NodeId,
     specifier: StackString,
     nv: Rc<PackageNv>,
@@ -273,7 +273,7 @@ impl GraphPath {
   }
 
   /// Gets if there is an ancestor with the same name & version along this path.
-  pub fn find_ancestor(&self, nv: &PackageNv) -> Option<Rc<GraphPath>> {
+  pub fn find_ancestor(&self, nv: &PackageNv) -> Option<MaybeArc<GraphPath>> {
     let mut maybe_next_node = self.previous_node.as_ref();
     while let Some(GraphPathNodeOrRoot::Node(next_node)) = maybe_next_node {
       // we've visited this before, so stop
@@ -289,7 +289,7 @@ impl GraphPath {
   pub fn get_path_to_ancestor_exclusive(
     &self,
     ancestor_node_id: NodeId,
-  ) -> Vec<&Rc<GraphPath>> {
+  ) -> Vec<&MaybeArc<GraphPath>> {
     let mut path = Vec::new();
     let mut maybe_next_node = self.previous_node.as_ref();
     while let Some(GraphPathNodeOrRoot::Node(next_node)) = maybe_next_node {
@@ -330,11 +330,11 @@ impl<'a> Iterator for GraphPathAncestorIterator<'a> {
 
 pub struct Graph {
   /// Each requirement is mapped to a specific name and version.
-  package_reqs: HashMap<PackageReq, Rc<PackageNv>>,
+  package_reqs: HashMap<PackageReq, MaybeArc<PackageNv>>,
   /// Then each name and version is mapped to an exact node id.
   /// Note: Uses a BTreeMap in order to create some determinism
   /// when creating the snapshot.
-  root_packages: BTreeMap<Rc<PackageNv>, NodeId>,
+  root_packages: BTreeMap<MaybeArc<PackageNv>, NodeId>,
   package_name_versions: HashMap<StackString, HashSet<Version>>,
   nodes: HashMap<NodeId, Node>,
   resolved_node_ids: ResolvedNodeIds,
@@ -378,7 +378,7 @@ impl Graph {
         })
         .collect::<Vec<_>>();
       let graph_resolved_id = ResolvedId {
-        nv: Rc::new(pkg_id.nv.clone()),
+        nv: MaybeArc::new(pkg_id.nv.clone()),
         peer_dependencies: peer_dep_ids,
       };
       let resolution = match packages.get(pkg_id) {
@@ -450,7 +450,7 @@ impl Graph {
       package_reqs: snapshot
         .package_reqs
         .into_iter()
-        .map(|(k, v)| (k, Rc::new(v)))
+        .map(|(k, v)| (k, MaybeArc::new(v)))
         .collect(),
       nodes: Default::default(),
       package_name_versions: Default::default(),
@@ -471,12 +471,12 @@ impl Graph {
         &mut created_package_ids,
         &Default::default(),
       );
-      graph.root_packages.insert(Rc::new(id), node_id);
+      graph.root_packages.insert(MaybeArc::new(id), node_id);
     }
     graph
   }
 
-  pub fn get_req_nv(&self, req: &PackageReq) -> Option<&Rc<PackageNv>> {
+  pub fn get_req_nv(&self, req: &PackageReq) -> Option<&MaybeArc<PackageNv>> {
     self.package_reqs.get(req)
   }
 
@@ -774,7 +774,7 @@ impl Graph {
 
   #[cfg(debug_assertions)]
   #[allow(unused, clippy::print_stderr)]
-  fn output_path(&self, path: &Rc<GraphPath>) {
+  fn output_path(&self, path: &MaybeArc<GraphPath>) {
     eprintln!("-----------");
     self.output_node(path.node_id(), false);
     for path in path.ancestors() {
@@ -833,26 +833,32 @@ impl Graph {
 }
 
 #[derive(Default)]
-struct DepEntryCache(HashMap<Rc<PackageNv>, Rc<Vec<NpmDependencyEntry>>>);
+struct DepEntryCache(
+  HashMap<MaybeArc<PackageNv>, MaybeArc<Vec<NpmDependencyEntry>>>,
+);
 
 impl DepEntryCache {
   pub fn store(
     &mut self,
-    nv: Rc<PackageNv>,
+    nv: MaybeArc<PackageNv>,
     version_info: &NpmPackageVersionInfo,
-  ) -> Result<Rc<Vec<NpmDependencyEntry>>, Box<NpmDependencyEntryError>> {
+  ) -> Result<MaybeArc<Vec<NpmDependencyEntry>>, Box<NpmDependencyEntryError>>
+  {
     debug_assert_eq!(nv.version, version_info.version);
     debug_assert!(!self.0.contains_key(&nv)); // we should not be re-inserting
     let mut deps = version_info.dependencies_as_entries(&nv.name)?;
     // Ensure name alphabetical and then version descending
     // so these are resolved in that order
     deps.sort();
-    let deps = Rc::new(deps);
+    let deps = MaybeArc::new(deps);
     self.0.insert(nv, deps.clone());
     Ok(deps)
   }
 
-  pub fn get(&self, id: &PackageNv) -> Option<&Rc<Vec<NpmDependencyEntry>>> {
+  pub fn get(
+    &self,
+    id: &PackageNv,
+  ) -> Option<&MaybeArc<Vec<NpmDependencyEntry>>> {
     self.0.get(id)
   }
 }
@@ -923,7 +929,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     &mut self,
     package_req: &PackageReq,
     package_info: &NpmPackageInfo,
-  ) -> Result<Rc<PackageNv>, NpmResolutionError> {
+  ) -> Result<MaybeArc<PackageNv>, NpmResolutionError> {
     if let Some(nv) = self.graph.get_req_nv(package_req) {
       return Ok(nv.clone()); // already added
     }
@@ -975,7 +981,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     &mut self,
     entry: &NpmDependencyEntry,
     package_info: &NpmPackageInfo,
-    parent_path: &Rc<GraphPath>,
+    parent_path: &MaybeArc<GraphPath>,
   ) -> Result<NodeId, NpmResolutionError> {
     debug_assert_eq!(entry.kind, NpmDependencyEntryKind::Dep);
     let parent_id = parent_path.node_id();
@@ -1021,7 +1027,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     version_req: &VersionReq,
     package_info: &NpmPackageInfo,
     parent_id: Option<NodeId>,
-  ) -> Result<(Rc<PackageNv>, NodeId), NpmResolutionError> {
+  ) -> Result<(MaybeArc<PackageNv>, NodeId), NpmResolutionError> {
     let info = self.version_resolver.resolve_best_package_version_info(
       version_req,
       package_info,
@@ -1033,7 +1039,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
         .iter(),
     )?;
     let resolved_id = ResolvedId {
-      nv: Rc::new(PackageNv {
+      nv: MaybeArc::new(PackageNv {
         name: package_info.name.clone(),
         version: info.version.clone(),
       }),
@@ -1479,7 +1485,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
 
   fn find_peer_dep_in_node(
     &self,
-    path: &Rc<GraphPath>,
+    path: &MaybeArc<GraphPath>,
     peer_dep: &NpmDependencyEntry,
     peer_package_info: &NpmPackageInfo,
     exclude_key: Option<&str>,
@@ -1570,8 +1576,8 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
   fn add_peer_deps_to_path(
     &mut self,
     // path from the node above the resolved dep to just above the peer dep
-    path: &[&Rc<GraphPath>],
-    peer_deps: &[(&ResolvedIdPeerDep, Rc<PackageNv>)],
+    path: &[&MaybeArc<GraphPath>],
+    peer_deps: &[(&ResolvedIdPeerDep, MaybeArc<PackageNv>)],
   ) {
     debug_assert!(!path.is_empty());
 
@@ -1698,7 +1704,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
   fn set_new_peer_dep(
     &mut self,
     // path from the node above the resolved dep to just above the peer dep
-    path: &[&Rc<GraphPath>],
+    path: &[&MaybeArc<GraphPath>],
     peer_dep_parent: GraphPathNodeOrRoot,
     peer_dep_specifier: &StackString,
     peer_dep_id: NodeId,
@@ -1771,8 +1777,8 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
 
   fn add_linked_circular_descendant(
     &mut self,
-    ancestor: &Rc<GraphPath>,
-    descendant: Rc<GraphPath>,
+    ancestor: &MaybeArc<GraphPath>,
+    descendant: MaybeArc<GraphPath>,
   ) {
     let ancestor_node_id = ancestor.node_id();
     let path = descendant.get_path_to_ancestor_exclusive(ancestor_node_id);
@@ -1936,7 +1942,7 @@ mod test {
     let mut ids = ResolvedNodeIds::default();
     let node_id = NodeId(0);
     let resolved_id = ResolvedId {
-      nv: Rc::new(PackageNv::from_str("package@1.1.1").unwrap()),
+      nv: MaybeArc::new(PackageNv::from_str("package@1.1.1").unwrap()),
       peer_dependencies: Vec::new(),
     };
     ids.set(node_id, resolved_id.clone());
@@ -1945,7 +1951,7 @@ mod test {
     assert_eq!(ids.get_node_id(&resolved_id), Some(node_id));
 
     let resolved_id_new = ResolvedId {
-      nv: Rc::new(PackageNv::from_str("package@1.1.2").unwrap()),
+      nv: MaybeArc::new(PackageNv::from_str("package@1.1.2").unwrap()),
       peer_dependencies: Vec::new(),
     };
     ids.set(node_id, resolved_id_new.clone());

@@ -20,10 +20,12 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::sync::Mutex;
+use std::sync::RwLock;
 use thiserror::Error;
 
 use super::common::NpmPackageVersionResolutionError;
-use crate::arc::{MaybeArc, MaybeRwLock};
+use crate::arc::{MaybeArc, MaybeRefCell};
 use crate::registry::NpmDependencyEntry;
 use crate::registry::NpmDependencyEntryError;
 use crate::registry::NpmDependencyEntryKind;
@@ -1782,7 +1784,6 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
   ) {
     let ancestor_node_id = ancestor.node_id();
     let path = descendant.get_path_to_ancestor_exclusive(ancestor_node_id);
-
     let ancestor_resolved_id = self
       .graph
       .resolved_node_ids

@@ -599,7 +599,8 @@ impl TestNpmRegistryApi {
   }
 }
 
-#[async_trait(?Send)]
+#[cfg_attr(feature = "sync", async_trait)]
+#[cfg_attr(not(feature = "sync"), async_trait(?Send))]
 impl NpmRegistryApi for TestNpmRegistryApi {
   async fn package_info(
     &self,

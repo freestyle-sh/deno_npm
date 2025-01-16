@@ -23,7 +23,7 @@ use std::hash::Hasher;
 use thiserror::Error;
 
 use super::common::NpmPackageVersionResolutionError;
-use crate::arc::MaybeArc;
+use crate::arc::{MaybeArc, MaybeRwLock};
 use crate::registry::NpmDependencyEntry;
 use crate::registry::NpmDependencyEntryError;
 use crate::registry::NpmDependencyEntryKind;

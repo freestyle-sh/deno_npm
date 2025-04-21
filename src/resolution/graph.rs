@@ -11,7 +11,6 @@ use indexmap::IndexMap;
 use indexmap::IndexSet;
 use log::debug;
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -22,7 +21,7 @@ use std::hash::Hasher;
 use thiserror::Error;
 
 use super::common::NpmPackageVersionResolutionError;
-use crate::arc::{MaybeArc, MaybeRefCell};
+use crate::arc::{MaybeArc, MaybeCell, MaybeRefCell};
 use crate::registry::NpmDependencyEntry;
 use crate::registry::NpmDependencyEntryError;
 use crate::registry::NpmDependencyEntryKind;
@@ -66,6 +65,12 @@ pub enum NpmResolutionError {
 /// A unique identifier to a node in the graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 struct NodeId(u32);
+
+#[cfg(feature = "sync")]
+unsafe impl bytemuck::Pod for NodeId {}
+
+#[cfg(feature = "sync")]
+unsafe impl bytemuck::Zeroable for NodeId {}
 
 /// A resolved package in the resolution graph.
 #[derive(Debug)]
@@ -180,11 +185,11 @@ impl ResolvedNodeIds {
 /// A pointer to a specific node in a graph path. The underlying node id
 /// may change as peer dependencies are created.
 #[derive(Debug)]
-struct NodeIdRef(Cell<NodeId>);
+struct NodeIdRef(MaybeCell<NodeId>);
 
 impl NodeIdRef {
   pub fn new(node_id: NodeId) -> Self {
-    NodeIdRef(Cell::new(node_id))
+    NodeIdRef(MaybeCell::new(node_id))
   }
 
   pub fn change(&self, node_id: NodeId) {

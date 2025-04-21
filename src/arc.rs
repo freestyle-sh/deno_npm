@@ -1,16 +1,17 @@
 #[cfg(feature = "sync")]
 mod internal {
+  use atomic::Atomic;
   use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
   #[derive(Debug, Default)]
   pub struct MaybeRefCell<T> {
-    inner: Arc<RwLock<T>>,
+    inner: RwLock<T>,
   }
 
   impl<T> MaybeRefCell<T> {
     pub fn new(value: T) -> Self {
       Self {
-        inner: Arc::new(RwLock::new(value)),
+        inner: RwLock::new(value),
       }
     }
 
@@ -23,21 +24,35 @@ mod internal {
     }
   }
 
-  impl<T> Clone for MaybeRefCell<T> {
-    fn clone(&self) -> Self {
-      Self {
-        inner: Arc::clone(&self.inner),
-      }
-    }
+  pub use std::sync::Arc as MaybeArc;
+
+  #[derive(Debug, Default)]
+  pub struct MaybeCell<T: bytemuck::Pod> {
+    inner: Atomic<T>,
   }
 
-  pub use std::sync::Arc as MaybeArc;
+  impl<T: bytemuck::Pod + Copy> MaybeCell<T> {
+    pub fn new(value: T) -> Self {
+      Self {
+        inner: Atomic::new(value),
+      }
+    }
+
+    pub fn get(&self) -> T {
+      self.inner.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn set(&self, value: T) {
+      self.inner.store(value, std::sync::atomic::Ordering::SeqCst);
+    }
+  }
 }
 
 #[cfg(not(feature = "sync"))]
 mod internal {
+  pub use std::cell::Cell as MaybeCell;
   pub use std::cell::RefCell as MaybeRefCell;
   pub use std::rc::Rc as MaybeArc;
 }
 
-pub use internal::{MaybeArc, MaybeRefCell};
+pub use internal::{MaybeArc, MaybeCell, MaybeRefCell};

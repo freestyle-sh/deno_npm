@@ -20,7 +20,6 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::hash::Hash;
 use std::hash::Hasher;
-use std::rc::Rc;
 use thiserror::Error;
 
 use super::common::NpmPackageVersionResolutionError;
@@ -223,17 +222,17 @@ struct GraphPath {
   nv: MaybeArc<PackageNv>,
   /// Descendants in the path that circularly link to an ancestor in a child. These
   /// descendants should be kept up to date and always point to this node.
-  linked_circular_descendants: RefCell<Vec<Rc<GraphPath>>>,
+  linked_circular_descendants: RefCell<Vec<MaybeArc<GraphPath>>>,
   mode: GraphPathResolutionMode,
 }
 
 impl GraphPath {
   pub fn for_root(
     node_id: NodeId,
-    nv: Rc<PackageNv>,
+    nv: MaybeArc<PackageNv>,
     mode: GraphPathResolutionMode,
-  ) -> Rc<Self> {
-    Rc::new(Self {
+  ) -> MaybeArc<Self> {
+    MaybeArc::new(Self {
       previous_node: Some(GraphPathNodeOrRoot::Root(nv.clone())),
       node_id_ref: NodeIdRef::new(node_id),
       // use an empty specifier
@@ -260,10 +259,10 @@ impl GraphPath {
     self: &MaybeArc<GraphPath>,
     node_id: NodeId,
     specifier: StackString,
-    nv: Rc<PackageNv>,
+    nv: MaybeArc<PackageNv>,
     mode: GraphPathResolutionMode,
-  ) -> Rc<Self> {
-    Rc::new(Self {
+  ) -> MaybeArc<Self> {
+    MaybeArc::new(Self {
       previous_node: Some(GraphPathNodeOrRoot::Node(self.clone())),
       node_id_ref: NodeIdRef::new(node_id),
       specifier,
@@ -500,7 +499,7 @@ impl Graph {
   fn get_npm_pkg_id_from_resolved_id_with_seen(
     &self,
     resolved_id: &ResolvedId,
-    seen: HashSet<Rc<PackageNv>>,
+    seen: HashSet<MaybeArc<PackageNv>>,
   ) -> NpmPackageId {
     if resolved_id.peer_dependencies.is_empty() {
       NpmPackageId {
@@ -866,14 +865,14 @@ impl DepEntryCache {
 
 #[derive(Default)]
 struct UnresolvedOptionalPeers {
-  seen: HashMap<Rc<PackageNv>, Vec<StackString>>,
+  seen: HashMap<MaybeArc<PackageNv>, Vec<StackString>>,
   seen_count: usize,
 }
 
 impl UnresolvedOptionalPeers {
   pub fn has_seen(
     &self,
-    parent_nv: &Rc<PackageNv>,
+    parent_nv: &MaybeArc<PackageNv>,
     specifier: &StackString,
   ) -> bool {
     let Some(entries) = self.seen.get(parent_nv) else {
@@ -884,7 +883,7 @@ impl UnresolvedOptionalPeers {
 
   pub fn mark_seen(
     &mut self,
-    parent_nv: Rc<PackageNv>,
+    parent_nv: MaybeArc<PackageNv>,
     specifier: &StackString,
   ) {
     let entries = self.seen.entry(parent_nv).or_default();
@@ -904,7 +903,7 @@ pub struct GraphDependencyResolver<'a, TNpmRegistryApi: NpmRegistryApi> {
   graph: &'a mut Graph,
   api: &'a TNpmRegistryApi,
   version_resolver: &'a NpmVersionResolver<'a>,
-  pending_unresolved_nodes: VecDeque<Rc<GraphPath>>,
+  pending_unresolved_nodes: VecDeque<MaybeArc<GraphPath>>,
   dep_entry_cache: DepEntryCache,
 }
 
@@ -1104,7 +1103,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
 
   async fn resolve_next_pending(
     &mut self,
-    parent_path: Rc<GraphPath>,
+    parent_path: MaybeArc<GraphPath>,
   ) -> Result<(), NpmResolutionError> {
     let (parent_nv, child_deps) = {
       let node_id = parent_path.node_id();
@@ -1284,13 +1283,13 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     specifier: &StackString,
     peer_dep: &NpmDependencyEntry,
     peer_package_info: &NpmPackageInfo,
-    ancestor_path: &Rc<GraphPath>,
-    previous_nv: Option<&Rc<PackageNv>>,
+    ancestor_path: &MaybeArc<GraphPath>,
+    previous_nv: Option<&MaybeArc<PackageNv>>,
   ) -> Result<Option<NodeId>, NpmResolutionError> {
     fn get_path(
       index: usize,
-      ancestor_path: &Rc<GraphPath>,
-    ) -> Vec<&Rc<GraphPath>> {
+      ancestor_path: &MaybeArc<GraphPath>,
+    ) -> Vec<&MaybeArc<GraphPath>> {
       let mut path = Vec::with_capacity(index + 2);
       path.push(ancestor_path);
       path.extend(ancestor_path.ancestors().take(index + 1).filter_map(|a| {
@@ -1490,7 +1489,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     peer_dep: &NpmDependencyEntry,
     peer_package_info: &NpmPackageInfo,
     exclude_key: Option<&str>,
-    original_resolving_path: &Rc<GraphPath>,
+    original_resolving_path: &MaybeArc<GraphPath>,
   ) -> Result<Option<(GraphPathNodeOrRoot, NodeId)>, NpmResolutionError> {
     let node_id = path.node_id();
     let resolved_node_id = self.graph.resolved_node_ids.get(node_id).unwrap();
@@ -1541,7 +1540,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
 
   fn add_unmet_peer_dep_diagnostic(
     &self,
-    original_resolving_path: &Rc<GraphPath>,
+    original_resolving_path: &MaybeArc<GraphPath>,
     peer_dep: &NpmDependencyEntry,
     resolved_version: Version,
   ) {
@@ -1665,7 +1664,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
   fn add_peer_deps_to_id(
     &self,
     id: &ResolvedId,
-    peer_deps: &[(&ResolvedIdPeerDep, Rc<PackageNv>)],
+    peer_deps: &[(&ResolvedIdPeerDep, MaybeArc<PackageNv>)],
   ) -> Option<ResolvedId> {
     let mut new_resolved_id = Cow::Borrowed(id);
     let peer_nvs = new_resolved_id
@@ -1832,8 +1831,8 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     &self,
     peer_dep: &NpmDependencyEntry,
     peer_package_info: &NpmPackageInfo,
-    children: impl Iterator<Item = (NodeId, &'nv Rc<PackageNv>)>,
-    original_resolving_path: &Rc<GraphPath>,
+    children: impl Iterator<Item = (NodeId, &'nv MaybeArc<PackageNv>)>,
+    original_resolving_path: &MaybeArc<GraphPath>,
   ) -> Result<Option<NodeId>, NpmResolutionError> {
     for (child_id, pkg_id) in children {
       if pkg_id.name == peer_dep.name {

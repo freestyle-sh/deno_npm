@@ -11,6 +11,7 @@ license = "MIT"
 
 [features]
 tracing = []
+sync = []
 
 [dependencies]
 async-trait = "0.1.68"
@@ -42,7 +43,3 @@ debug = true
 [[bench]]
 name = "bench"
 harness = false
-
-[features]
-
-sync = []

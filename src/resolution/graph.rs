@@ -12,7 +12,6 @@ use indexmap::IndexSet;
 use log::debug;
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -222,7 +221,7 @@ struct GraphPath {
   nv: MaybeArc<PackageNv>,
   /// Descendants in the path that circularly link to an ancestor in a child. These
   /// descendants should be kept up to date and always point to this node.
-  linked_circular_descendants: RefCell<Vec<MaybeArc<GraphPath>>>,
+  linked_circular_descendants: MaybeRefCell<Vec<MaybeArc<GraphPath>>>,
   mode: GraphPathResolutionMode,
 }
 
@@ -899,7 +898,7 @@ impl UnresolvedOptionalPeers {
 }
 
 pub struct GraphDependencyResolver<'a, TNpmRegistryApi: NpmRegistryApi> {
-  unmet_peer_diagnostics: RefCell<IndexSet<UnmetPeerDepDiagnostic>>,
+  unmet_peer_diagnostics: MaybeRefCell<IndexSet<UnmetPeerDepDiagnostic>>,
   graph: &'a mut Graph,
   api: &'a TNpmRegistryApi,
   version_resolver: &'a NpmVersionResolver<'a>,

@@ -2,35 +2,30 @@
 
 use deno_error::JsError;
 use deno_lockfile::Lockfile;
+use deno_semver::StackString;
+use deno_semver::VersionReq;
 use deno_semver::package::PackageName;
 use deno_semver::package::PackageNv;
 use deno_semver::package::PackageReq;
-use deno_semver::StackString;
-use deno_semver::VersionReq;
-use futures::stream::FuturesOrdered;
 use futures::StreamExt;
+use futures::stream::FuturesOrdered;
 use serde::Deserialize;
 use serde::Serialize;
-use std::collections::hash_map;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::collections::hash_map;
 use std::sync::Arc;
 use thiserror::Error;
 
+use super::NpmPackageVersionNotFound;
+use super::UnmetPeerDepDiagnostic;
 use super::common::NpmVersionResolver;
 use super::graph::Graph;
 use super::graph::GraphDependencyResolver;
 use super::graph::NpmResolutionError;
-use super::NpmPackageVersionNotFound;
-use super::UnmetPeerDepDiagnostic;
 
-use crate::registry::NpmPackageInfo;
-use crate::registry::NpmPackageVersionDistInfo;
-use crate::registry::NpmPackageVersionInfo;
-use crate::registry::NpmRegistryApi;
-use crate::registry::NpmRegistryPackageInfoLoadError;
 use crate::NpmPackageCacheFolderId;
 use crate::NpmPackageExtraInfo;
 use crate::NpmPackageId;
@@ -38,6 +33,12 @@ use crate::NpmPackageIdDeserializationError;
 use crate::NpmResolutionPackage;
 use crate::NpmResolutionPackageSystemInfo;
 use crate::NpmSystemInfo;
+use crate::registry::NpmPackageInfo;
+use crate::registry::NpmPackageVersionDistInfo;
+use crate::registry::NpmPackageVersionInfo;
+use crate::registry::NpmRegistryApi;
+use crate::registry::NpmRegistryPackageInfoLoadError;
+use crate::resolution::Reporter;
 
 #[derive(Debug, Error, Clone, JsError)]
 #[class(type)]
@@ -196,8 +197,8 @@ pub struct AddPkgReqsOptions<'a> {
   /// Known good version requirement to use for the `@types/node` package
   /// when the version is unspecified or "latest".
   pub types_node_version_req: Option<VersionReq>,
-  /// Packages that are marked as "patch" in the config file.
-  pub patch_packages: &'a HashMap<PackageName, Vec<NpmPackageVersionInfo>>,
+  /// Packages that are marked as "links" in the config file.
+  pub link_packages: &'a HashMap<PackageName, Vec<NpmPackageVersionInfo>>,
 }
 
 #[derive(Debug)]
@@ -300,6 +301,7 @@ impl NpmResolutionSnapshot {
     self,
     api: &impl NpmRegistryApi,
     options: AddPkgReqsOptions<'_>,
+    reporter: Option<&dyn Reporter>,
   ) -> AddPkgReqsResult {
     enum InfoOrNv {
       InfoResult(Result<Arc<NpmPackageInfo>, NpmRegistryPackageInfoLoadError>),
@@ -325,12 +327,16 @@ impl NpmResolutionSnapshot {
 
     let version_resolver = NpmVersionResolver {
       types_node_version_req: options.types_node_version_req,
-      patch_packages: options.patch_packages,
+      link_packages: options.link_packages,
     };
     // go over the top level package names first (npm package reqs and pending unresolved),
     // then down the tree one level at a time through all the branches
-    let mut resolver =
-      GraphDependencyResolver::new(&mut graph, api, &version_resolver);
+    let mut resolver = GraphDependencyResolver::new(
+      &mut graph,
+      api,
+      &version_resolver,
+      reporter,
+    );
 
     // The package reqs and ids should already be sorted
     // in the order they should be resolved in.
@@ -369,9 +375,8 @@ impl NpmResolutionSnapshot {
         Ok(()) => {
           unmet_peer_diagnostics = resolver.take_unmet_peer_diagnostics();
           graph
-            .into_snapshot(api, version_resolver.patch_packages)
+            .into_snapshot(api, version_resolver.link_packages)
             .await
-            .map_err(NpmResolutionError::Registry)
         }
         Err(err) => Err(err),
       },
@@ -464,42 +469,45 @@ impl NpmResolutionSnapshot {
   ) -> ValidSerializedNpmResolutionSnapshot {
     let mut final_packages = Vec::with_capacity(self.packages.len());
     let mut pending = VecDeque::with_capacity(self.packages.len());
-    let mut visited_ids = HashSet::with_capacity(self.packages.len());
+    let mut visited_nvs = HashSet::with_capacity(self.packages.len());
 
     // add the root packages
     for pkg_id in self.root_packages.values() {
-      if visited_ids.insert(pkg_id) {
-        pending.push_back(self.packages.get(pkg_id).unwrap());
+      if visited_nvs.insert(&pkg_id.nv) {
+        pending.push_back(&pkg_id.nv);
       }
     }
 
-    while let Some(pkg) = pending.pop_front() {
-      let mut new_pkg = SerializedNpmResolutionSnapshotPackage {
-        id: pkg.id.clone(),
-        dependencies: HashMap::with_capacity(pkg.dependencies.len()),
-        optional_peer_dependencies: pkg.optional_peer_dependencies.clone(),
-        // the fields below are stripped from the output
-        system: Default::default(),
-        optional_dependencies: Default::default(),
-        extra: pkg.extra.clone(),
-        dist: pkg.dist.clone(),
-        is_deprecated: pkg.is_deprecated,
-        has_bin: pkg.has_bin,
-        has_scripts: pkg.has_scripts,
-      };
-      for (key, dep_id) in &pkg.dependencies {
-        let dep = self.packages.get(dep_id).unwrap();
+    while let Some(nv) = pending.pop_front() {
+      for id in self.package_ids_for_nv(nv) {
+        let pkg = self.packages.get(id).unwrap();
+        let mut new_pkg = SerializedNpmResolutionSnapshotPackage {
+          id: pkg.id.clone(),
+          dependencies: HashMap::with_capacity(pkg.dependencies.len()),
+          optional_peer_dependencies: pkg.optional_peer_dependencies.clone(),
+          // the fields below are stripped from the output
+          system: Default::default(),
+          optional_dependencies: Default::default(),
+          extra: pkg.extra.clone(),
+          dist: pkg.dist.clone(),
+          is_deprecated: pkg.is_deprecated,
+          has_bin: pkg.has_bin,
+          has_scripts: pkg.has_scripts,
+        };
+        for (key, dep_id) in &pkg.dependencies {
+          let dep = self.packages.get(dep_id).unwrap();
 
-        let matches_system = !pkg.optional_dependencies.contains(key)
-          || dep.system.matches_system(system_info);
-        if matches_system {
-          new_pkg.dependencies.insert(key.clone(), dep_id.clone());
-          if visited_ids.insert(dep_id) {
-            pending.push_back(dep);
+          let matches_system = !pkg.optional_dependencies.contains(key)
+            || dep.system.matches_system(system_info);
+          if matches_system {
+            new_pkg.dependencies.insert(key.clone(), dep_id.clone());
+            if visited_nvs.insert(&dep_id.nv) {
+              pending.push_back(&dep_id.nv);
+            }
           }
         }
+        final_packages.push(new_pkg);
       }
-      final_packages.push(new_pkg);
     }
 
     ValidSerializedNpmResolutionSnapshot(SerializedNpmResolutionSnapshot {
@@ -539,7 +547,23 @@ impl NpmResolutionSnapshot {
     &self,
     req: &PackageReq,
   ) -> Result<&NpmResolutionPackage, PackageReqNotFoundError> {
-    match self.package_reqs.get(req) {
+    let package_nv = self.package_reqs.get(req).or_else(|| {
+      // fallback to iterating over the versions
+      req
+        .version_req
+        .tag()
+        .is_none()
+        .then(|| self.packages_by_name.get(&req.name))
+        .flatten()
+        .and_then(|ids| {
+          ids
+            .iter()
+            .filter(|id| req.version_req.matches(&id.nv.version))
+            .map(|id| &id.nv)
+            .max_by_key(|nv| &nv.version)
+        })
+    });
+    match package_nv {
       Some(nv) => self
         .resolve_package_from_deno_module(nv)
         // ignore the nv not found error and return a req not found
@@ -558,12 +582,11 @@ impl NpmResolutionSnapshot {
       .get(&pkg_cache_folder_id.nv.name)
       .and_then(|ids| {
         for id in ids {
-          if id.nv == pkg_cache_folder_id.nv {
-            if let Some(pkg) = self.packages.get(id) {
-              if pkg.copy_index == pkg_cache_folder_id.copy_index {
-                return Some(pkg);
-              }
-            }
+          if id.nv == pkg_cache_folder_id.nv
+            && let Some(pkg) = self.packages.get(id)
+            && pkg.copy_index == pkg_cache_folder_id.copy_index
+          {
+            return Some(pkg);
           }
         }
         None
@@ -589,7 +612,7 @@ impl NpmResolutionSnapshot {
 
   pub fn top_level_packages(
     &self,
-  ) -> hash_map::Values<PackageNv, NpmPackageId> {
+  ) -> hash_map::Values<'_, PackageNv, NpmPackageId> {
     self.root_packages.values()
   }
 
@@ -643,10 +666,10 @@ impl NpmResolutionSnapshot {
     // TODO(bartlomieju): this should use a reverse lookup table in the
     // snapshot instead of resolving best version again.
     let any_version_req = VersionReq::parse_from_npm("*").unwrap();
-    if let Some(id) = self.resolve_best_package_id(name, &any_version_req) {
-      if let Some(pkg) = self.packages.get(&id) {
-        return Ok(pkg);
-      }
+    if let Some(id) = self.resolve_best_package_id(name, &any_version_req)
+      && let Some(pkg) = self.packages.get(&id)
+    {
+      return Ok(pkg);
     }
 
     Err(Box::new(PackageNotFoundFromReferrerError::Package {
@@ -671,28 +694,27 @@ impl NpmResolutionSnapshot {
   ) -> Vec<NpmResolutionPackage> {
     let mut packages = Vec::with_capacity(self.packages.len());
     let mut pending = VecDeque::with_capacity(self.packages.len());
-    let mut visited_ids = HashSet::with_capacity(self.packages.len());
+    let mut visited_nvs = HashSet::with_capacity(self.packages.len());
 
     for pkg_id in self.root_packages.values() {
-      if visited_ids.insert(pkg_id) {
-        pending.push_back(self.packages.get(pkg_id).unwrap());
+      if visited_nvs.insert(&pkg_id.nv) {
+        pending.push_back(&pkg_id.nv);
       }
     }
 
-    while let Some(pkg) = pending.pop_front() {
-      packages.push(pkg.clone());
+    while let Some(nv) = pending.pop_front() {
+      for pkg_id in self.package_ids_for_nv(nv) {
+        let pkg = self.packages.get(pkg_id).unwrap();
+        packages.push(pkg.clone());
 
-      for (key, dep_id) in &pkg.dependencies {
-        if visited_ids.contains(&dep_id) {
-          continue;
-        }
-        let dep = self.packages.get(dep_id).unwrap();
+        for (key, dep_id) in &pkg.dependencies {
+          let dep = self.packages.get(dep_id).unwrap();
 
-        let matches_system = !pkg.optional_dependencies.contains(key)
-          || dep.system.matches_system(system_info);
-        if matches_system {
-          pending.push_back(dep);
-          visited_ids.insert(dep_id);
+          let matches_system = !pkg.optional_dependencies.contains(key)
+            || dep.system.matches_system(system_info);
+          if matches_system && visited_nvs.insert(&dep_id.nv) {
+            pending.push_back(&dep.id.nv);
+          }
         }
       }
     }
@@ -830,10 +852,10 @@ impl SnapshotPackageCopyIndexResolver {
 
 fn name_without_path(name: &str) -> &str {
   let mut search_start_index = 0;
-  if name.starts_with('@') {
-    if let Some(slash_index) = name.find('/') {
-      search_start_index = slash_index + 1;
-    }
+  if name.starts_with('@')
+    && let Some(slash_index) = name.find('/')
+  {
+    search_start_index = slash_index + 1;
   }
   if let Some(slash_index) = &name[search_start_index..].find('/') {
     // get the name up until the path slash
@@ -860,13 +882,44 @@ pub enum SnapshotFromLockfileError {
 }
 
 pub struct SnapshotFromLockfileParams<'a> {
-  pub patch_packages: &'a HashMap<PackageName, Vec<NpmPackageVersionInfo>>,
+  pub link_packages: &'a HashMap<PackageName, Vec<NpmPackageVersionInfo>>,
   pub lockfile: &'a Lockfile,
   pub default_tarball_url: &'a dyn DefaultTarballUrlProvider,
 }
 
 pub trait DefaultTarballUrlProvider {
   fn default_tarball_url(&self, nv: &PackageNv) -> String;
+}
+
+impl Default for &dyn DefaultTarballUrlProvider {
+  fn default() -> Self {
+    &NpmRegistryDefaultTarballUrlProvider
+  }
+}
+
+/// `DefaultTarballUrlProvider` that uses the url of the real npm registry.
+#[derive(Debug, Default, Clone)]
+pub struct NpmRegistryDefaultTarballUrlProvider;
+
+impl DefaultTarballUrlProvider for NpmRegistryDefaultTarballUrlProvider {
+  fn default_tarball_url(
+    &self,
+    nv: &deno_semver::package::PackageNv,
+  ) -> String {
+    let scope = nv.scope();
+    let package_name = if let Some(scope) = scope {
+      nv.name
+        .strip_prefix(scope)
+        .unwrap_or(&nv.name)
+        .trim_start_matches('/')
+    } else {
+      &nv.name
+    };
+    format!(
+      "https://registry.npmjs.org/{}/-/{}-{}.tgz",
+      nv.name, package_name, nv.version
+    )
+  }
 }
 
 fn dist_from_incomplete_package_info(
@@ -961,8 +1014,8 @@ pub fn snapshot_from_lockfile(
         os: package.os.clone(),
       },
       is_deprecated: package.deprecated,
-      has_bin: package.has_bin,
-      has_scripts: package.has_scripts,
+      has_bin: package.bin,
+      has_scripts: package.scripts,
       optional_peer_dependencies: package
         .optional_peers
         .clone()
@@ -1192,16 +1245,20 @@ mod tests {
       .unwrap();
     assert_eq!(pkg.id.as_serialized(), "a@1.0.0_b@1.0.0");
     assert_eq!(pkg.copy_index, 1);
-    assert!(snapshot
-      .resolve_pkg_from_pkg_cache_folder_id(&npm_cache_folder_id(
-        "a", "1.0.0", 2,
-      ))
-      .is_err());
-    assert!(snapshot
-      .resolve_pkg_from_pkg_cache_folder_id(&npm_cache_folder_id(
-        "b", "1.0.0", 2,
-      ))
-      .is_err());
+    assert!(
+      snapshot
+        .resolve_pkg_from_pkg_cache_folder_id(&npm_cache_folder_id(
+          "a", "1.0.0", 2,
+        ))
+        .is_err()
+    );
+    assert!(
+      snapshot
+        .resolve_pkg_from_pkg_cache_folder_id(&npm_cache_folder_id(
+          "b", "1.0.0", 2,
+        ))
+        .is_err()
+    );
   }
 
   fn npm_cache_folder_id(
@@ -1313,12 +1370,14 @@ mod tests {
     .await
     .unwrap();
 
-    assert!(snapshot_from_lockfile(SnapshotFromLockfileParams {
-      lockfile: &lockfile,
-      patch_packages: &Default::default(),
-      default_tarball_url: &TestDefaultTarballUrlProvider,
-    })
-    .is_ok());
+    assert!(
+      snapshot_from_lockfile(SnapshotFromLockfileParams {
+        lockfile: &lockfile,
+        link_packages: &Default::default(),
+        default_tarball_url: &TestDefaultTarballUrlProvider,
+      })
+      .is_ok()
+    );
   }
 
   #[tokio::test]
@@ -1365,7 +1424,7 @@ mod tests {
 
     let snapshot = snapshot_from_lockfile(SnapshotFromLockfileParams {
       lockfile: &lockfile,
-      patch_packages: &Default::default(),
+      link_packages: &Default::default(),
       default_tarball_url: &TestDefaultTarballUrlProvider,
     })
     .unwrap();
@@ -1460,6 +1519,34 @@ mod tests {
         root_packages: Default::default(),
         packages: Default::default(),
       },
+    );
+  }
+
+  #[test]
+  fn resolve_pkg_from_pkg_req_types_node_broad() {
+    let types_a = package("@types/a@1.0.0", &[]);
+    let types_node = package("@types/node@1.0.0", &[]);
+    let serialized = SerializedNpmResolutionSnapshot {
+      root_packages: root_pkgs(&[
+        ("@types/a@1", "@types/a@1.0.0"),
+        ("@types/node@1", "@types/node@1.0.0"),
+      ]),
+      packages: vec![types_a, types_node],
+    };
+    let snapshot = NpmResolutionSnapshot::new(serialized.into_valid().unwrap());
+    // the cli will look up a broad @types/node package in the snapshot, so
+    // support doing that even if it's not in one of the reqs.
+    let pkg = snapshot
+      .resolve_pkg_from_pkg_req(&PackageReq::from_str("@types/node@*").unwrap())
+      .unwrap();
+    assert_eq!(pkg.id.nv.version.to_string(), "1.0.0");
+    assert!(
+      snapshot
+        .resolve_pkg_from_pkg_req(
+          &PackageReq::from_str("@types/node@next").unwrap()
+        )
+        // shouldn't panic
+        .is_err()
     );
   }
 }

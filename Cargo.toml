@@ -1,7 +1,7 @@
 [package]
 name = "deno_npm"
-version = "0.31.1"
-edition = "2021"
+version = "0.38.1"
+edition = "2024"
 description = "npm registry client and dependency resolver used in the Deno CLI"
 homepage = "https://deno.land/"
 repository = "https://github.com/denoland/deno_npm"
@@ -15,9 +15,10 @@ sync = ["dep:atomic", "dep:bytemuck"]
 
 [dependencies]
 async-trait = "0.1.68"
-deno_semver = "0.7.0"
-deno_error = "0.5.2"
-deno_lockfile = "0.27.0"
+capacity_builder = "0.5.0"
+deno_semver = "0.9.0"
+deno_error = "0.7.0"
+deno_lockfile = "0.31.0"
 indexmap = "2"
 monch = "0.5.0"
 log = "0.4"
@@ -26,9 +27,6 @@ serde_json = { version = "1.0.67", features = ["preserve_order"] }
 thiserror = "2.0.3"
 futures = "0.3.28"
 url = "2"
-capacity_builder = "0.5.0"
-atomic = { version = "0.6.0", optional = true }
-bytemuck = { version = "1.22.0", optional = true }
 
 [dev-dependencies]
 divan = "0.1.17"

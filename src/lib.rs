@@ -13,11 +13,11 @@ use capacity_builder::CapacityDisplay;
 use capacity_builder::StringAppendable;
 use capacity_builder::StringBuilder;
 use deno_error::JsError;
-use deno_semver::package::PackageNv;
 use deno_semver::CowVec;
 use deno_semver::SmallStackString;
 use deno_semver::StackString;
 use deno_semver::Version;
+use deno_semver::package::PackageNv;
 use registry::NpmPackageVersionBinEntry;
 use registry::NpmPackageVersionDistInfo;
 use resolution::SerializedNpmResolutionSnapshotPackage;
@@ -146,7 +146,7 @@ impl NpmPackageId {
   ) -> Result<Self, NpmPackageIdDeserializationError> {
     use monch::*;
 
-    fn parse_name(input: &str) -> ParseResult<&str> {
+    fn parse_name(input: &str) -> ParseResult<'_, &str> {
       if_not_empty(substring(move |input| {
         for (pos, c) in input.char_indices() {
           // first character might be a scope, so skip it
@@ -158,11 +158,11 @@ impl NpmPackageId {
       }))(input)
     }
 
-    fn parse_version(input: &str) -> ParseResult<&str> {
+    fn parse_version(input: &str) -> ParseResult<'_, &str> {
       if_not_empty(substring(skip_while(|c| c != '_')))(input)
     }
 
-    fn parse_name_and_version(input: &str) -> ParseResult<(&str, Version)> {
+    fn parse_name_and_version(input: &str) -> ParseResult<'_, (&str, Version)> {
       let (input, name) = parse_name(input)?;
       let (input, _) = ch('@')(input)?;
       let at_version_input = input;
@@ -180,7 +180,7 @@ impl NpmPackageId {
     fn parse_level_at_level<'a>(
       level: usize,
     ) -> impl Fn(&'a str) -> ParseResult<'a, ()> {
-      fn parse_level(input: &str) -> ParseResult<usize> {
+      fn parse_level(input: &str) -> ParseResult<'_, usize> {
         let level = input.chars().take_while(|c| *c == '_').count();
         Ok((&input[level..], level))
       }
@@ -325,7 +325,7 @@ pub struct NpmResolutionPackage {
   #[serde(flatten)]
   pub system: NpmResolutionPackageSystemInfo,
   /// The information used for installing the package. When `None`,
-  /// it means the package was a workspace patched package and
+  /// it means the package was a workspace linked package and
   /// the local copy should be used instead.
   pub dist: Option<NpmPackageVersionDistInfo>,
   /// Key is what the package refers to the other package as,
@@ -502,7 +502,10 @@ mod test {
 
     // this shouldn't change because it's used in the lockfile
     let serialized = id.as_serialized();
-    assert_eq!(serialized, "pkg-a@1.2.3_pkg-b@3.2.1__pkg-c@1.3.2__pkg-d@2.3.4_pkg-e@2.3.1__pkg-f@2.3.1");
+    assert_eq!(
+      serialized,
+      "pkg-a@1.2.3_pkg-b@3.2.1__pkg-c@1.3.2__pkg-d@2.3.4_pkg-e@2.3.1__pkg-f@2.3.1"
+    );
     assert_eq!(NpmPackageId::from_serialized(&serialized).unwrap(), id);
   }
 

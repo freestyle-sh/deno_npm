@@ -1,27 +1,29 @@
 // Copyright 2018-2024 the Deno authors. MIT license.
 
-use deno_semver::package::PackageName;
-use deno_semver::package::PackageNv;
-use deno_semver::package::PackageReq;
 use deno_semver::StackString;
 use deno_semver::Version;
 use deno_semver::VersionReq;
+use deno_semver::package::PackageName;
+use deno_semver::package::PackageNv;
+use deno_semver::package::PackageReq;
 use futures::StreamExt;
 use indexmap::IndexMap;
 use indexmap::IndexSet;
 use log::debug;
 use std::borrow::Cow;
-use std::collections::hash_map::DefaultHasher;
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 use thiserror::Error;
 
 use super::common::NpmPackageVersionResolutionError;
-use crate::arc::{MaybeArc, MaybeCell, MaybeRefCell};
+use crate::NpmResolutionPackageSystemInfo;
 use crate::registry::NpmDependencyEntry;
 use crate::registry::NpmDependencyEntryError;
 use crate::registry::NpmDependencyEntryKind;
@@ -31,12 +33,16 @@ use crate::registry::NpmRegistryApi;
 use crate::registry::NpmRegistryPackageInfoLoadError;
 use crate::resolution::collections::OneDirectionalLinkedList;
 use crate::resolution::snapshot::SnapshotPackageCopyIndexResolver;
-use crate::NpmResolutionPackageSystemInfo;
 
 use super::common::NpmVersionResolver;
 use super::snapshot::NpmResolutionSnapshot;
 use crate::NpmPackageId;
 use crate::NpmResolutionPackage;
+
+pub trait Reporter: std::fmt::Debug + Send + Sync {
+  #[allow(unused_variables)]
+  fn on_resolved(&self, package_req: &PackageReq, nv: &PackageNv) {}
+}
 
 // todo(dsherret): for perf we should use an arena/bump allocator for
 // creating the nodes and paths since this is done in a phase
@@ -307,7 +313,7 @@ impl GraphPath {
     path
   }
 
-  pub fn ancestors(&self) -> GraphPathAncestorIterator {
+  pub fn ancestors(&self) -> GraphPathAncestorIterator<'_> {
     GraphPathAncestorIterator {
       next: self.previous_node.as_ref(),
     }
@@ -330,6 +336,12 @@ impl<'a> Iterator for GraphPathAncestorIterator<'a> {
       None
     }
   }
+}
+
+struct PackagesForSnapshot<'a> {
+  packages: Vec<NpmResolutionPackage>,
+  packages_by_name: HashMap<PackageName, Vec<NpmPackageId>>,
+  traversed_ids: HashSet<&'a NpmPackageId>,
 }
 
 pub struct Graph {
@@ -634,10 +646,10 @@ impl Graph {
   }
 
   pub async fn into_snapshot<TNpmRegistryApi: NpmRegistryApi>(
-    mut self,
+    self,
     api: &TNpmRegistryApi,
-    patch_packages: &HashMap<PackageName, Vec<NpmPackageVersionInfo>>,
-  ) -> Result<NpmResolutionSnapshot, NpmRegistryPackageInfoLoadError> {
+    link_packages: &HashMap<PackageName, Vec<NpmPackageVersionInfo>>,
+  ) -> Result<NpmResolutionSnapshot, NpmResolutionError> {
     #[cfg(feature = "tracing")]
     if !self.traces.is_empty() {
       super::tracing::output(&self.traces);
@@ -648,13 +660,43 @@ impl Graph {
       .keys()
       .map(|node_id| (*node_id, self.get_npm_pkg_id(*node_id)))
       .collect::<HashMap<_, _>>();
-    let mut packages: Vec<NpmResolutionPackage> =
-      Vec::with_capacity(self.nodes.len());
-    let mut packages_by_name: HashMap<PackageName, Vec<_>> =
-      HashMap::with_capacity(self.nodes.len());
-    let mut traversed_ids = HashSet::with_capacity(self.nodes.len());
-    let mut pending = VecDeque::new();
 
+    let pkgs = match self
+      .resolve_packages_for_snapshot_with_maybe_restart(
+        api,
+        link_packages,
+        &packages_to_pkg_ids,
+      )
+      .await?
+    {
+      Some(pkgs) => pkgs,
+      None => self
+        .resolve_packages_for_snapshot_with_maybe_restart(
+          api,
+          link_packages,
+          &packages_to_pkg_ids,
+        )
+        .await?
+        // a panic here means the api is doing multiple reloads of data
+        // from the npm registry, which it shouldn't be doing and is considered
+        // a bug in that implementation
+        .unwrap(),
+    };
+
+    self.into_snapshot_from_packages(&packages_to_pkg_ids, pkgs)
+  }
+
+  async fn resolve_packages_for_snapshot_with_maybe_restart<
+    'ids,
+    TNpmRegistryApi: NpmRegistryApi,
+  >(
+    &self,
+    api: &TNpmRegistryApi,
+    link_packages: &HashMap<PackageName, Vec<NpmPackageVersionInfo>>,
+    packages_to_pkg_ids: &'ids HashMap<NodeId, NpmPackageId>,
+  ) -> Result<Option<PackagesForSnapshot<'ids>>, NpmResolutionError> {
+    let mut traversed_ids = HashSet::with_capacity(self.nodes.len());
+    let mut pending = VecDeque::with_capacity(self.nodes.len());
     for root_id in self.root_packages.values().copied() {
       let pkg_id = packages_to_pkg_ids.get(&root_id).unwrap();
       if traversed_ids.insert(pkg_id) {
@@ -662,20 +704,9 @@ impl Graph {
       }
     }
 
+    let mut pending_futures = futures::stream::FuturesOrdered::new();
     while let Some((node_id, pkg_id)) = pending.pop_front() {
       let node = self.nodes.get(&node_id).unwrap();
-
-      packages_by_name
-        .entry(pkg_id.nv.name.clone())
-        .or_default()
-        .push(pkg_id.clone());
-
-      // at this point the api should have this cached
-      let package_info = api.package_info(&pkg_id.nv.name).await?;
-      let version_info = package_info
-        .version_info(&pkg_id.nv, patch_packages)
-        .unwrap();
-
       let mut dependencies = HashMap::with_capacity(node.children.len());
       for (specifier, child_id) in &node.children {
         let child_id = *child_id;
@@ -685,6 +716,40 @@ impl Graph {
         }
         dependencies.insert(specifier.clone(), child_pkg_id.clone());
       }
+
+      pending_futures.push_back(async move {
+        let package_info = api.package_info(&pkg_id.nv.name).await?;
+        Ok::<_, NpmRegistryPackageInfoLoadError>((
+          pkg_id,
+          dependencies,
+          package_info,
+        ))
+      });
+    }
+
+    let mut packages_by_name: HashMap<PackageName, Vec<_>> =
+      HashMap::with_capacity(self.nodes.len());
+    let mut packages: Vec<NpmResolutionPackage> =
+      Vec::with_capacity(self.nodes.len());
+    while let Some(result) = pending_futures.next().await {
+      let (pkg_id, dependencies, package_info) = result?;
+      let version_info =
+        match package_info.version_info(&pkg_id.nv, link_packages) {
+          Ok(info) => info,
+          Err(err) => {
+            if api.mark_force_reload() {
+              return Ok(None);
+            }
+            return Err(NpmResolutionError::Resolution(
+              NpmPackageVersionResolutionError::VersionNotFound(err),
+            ));
+          }
+        };
+
+      packages_by_name
+        .entry(pkg_id.nv.name.clone())
+        .or_default()
+        .push(pkg_id.clone());
 
       packages.push(NpmResolutionPackage {
         copy_index: 0, // this is set below at the end
@@ -718,6 +783,24 @@ impl Graph {
         dependencies,
       });
     }
+
+    Ok(Some(PackagesForSnapshot {
+      packages,
+      packages_by_name,
+      traversed_ids,
+    }))
+  }
+
+  fn into_snapshot_from_packages(
+    mut self,
+    packages_to_pkg_ids: &HashMap<NodeId, NpmPackageId>,
+    pkgs_for_snapshot: PackagesForSnapshot<'_>,
+  ) -> Result<NpmResolutionSnapshot, NpmResolutionError> {
+    let PackagesForSnapshot {
+      traversed_ids,
+      packages,
+      packages_by_name,
+    } = pkgs_for_snapshot;
 
     // after traversing, see if there are any copy indexes that
     // need to be updated to a new location based on an id
@@ -909,6 +992,7 @@ pub struct GraphDependencyResolver<'a, TNpmRegistryApi: NpmRegistryApi> {
   version_resolver: &'a NpmVersionResolver<'a>,
   pending_unresolved_nodes: VecDeque<MaybeArc<GraphPath>>,
   dep_entry_cache: DepEntryCache,
+  reporter: Option<&'a dyn Reporter>,
 }
 
 impl<'a, TNpmRegistryApi: NpmRegistryApi>
@@ -918,6 +1002,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
     graph: &'a mut Graph,
     api: &'a TNpmRegistryApi,
     version_resolver: &'a NpmVersionResolver,
+    reporter: Option<&'a dyn Reporter>,
   ) -> Self {
     Self {
       unmet_peer_diagnostics: Default::default(),
@@ -926,6 +1011,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
       version_resolver,
       pending_unresolved_nodes: Default::default(),
       dep_entry_cache: Default::default(),
+      reporter,
     }
   }
 
@@ -995,6 +1081,14 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
       package_info,
       Some(parent_id),
     )?;
+
+    if let Some(reporter) = &self.reporter {
+      let package_req = PackageReq {
+        name: entry.name.clone(),
+        version_req: entry.version_req.clone(),
+      };
+      reporter.on_resolved(&package_req, &child_nv);
+    }
     // Some packages may resolves to themselves as a dependency. If this occurs,
     // just ignore adding these as dependencies because this is likely a mistake
     // in the package.
@@ -1130,7 +1224,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
         // need to parallelize
         let package_info = self.api.package_info(&pkg_nv.name).await?;
         let version_info = package_info
-          .version_info(&pkg_nv, self.version_resolver.patch_packages)
+          .version_info(&pkg_nv, self.version_resolver.link_packages)
           .map_err(NpmPackageVersionResolutionError::VersionNotFound)?;
         self.dep_entry_cache.store(pkg_nv.clone(), version_info)?
       };
@@ -1156,7 +1250,7 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
         Err(NpmRegistryPackageInfoLoadError::PackageNotExists { .. })
           if matches!(dep.kind, NpmDependencyEntryKind::OptionalPeer) =>
         {
-          continue
+          continue;
         }
         Err(e) => return Err(e.into()),
       };
@@ -1312,21 +1406,20 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
 
     if !peer_dep.kind.is_optional()
       && matches!(ancestor_path.mode, GraphPathResolutionMode::OptionalPeers)
+      && let Some(previous_nv) = previous_nv.cloned()
     {
-      if let Some(previous_nv) = previous_nv.cloned() {
-        // don't re-resolve a peer dependency when only going through the graph
-        // resolving optional peers
-        let node = self.graph.nodes.get(&ancestor_path.node_id()).unwrap();
-        let previous_id = node.children.get(&peer_dep.bare_specifier).unwrap();
-        let new_path = ancestor_path.with_id(
-          *previous_id,
-          peer_dep.bare_specifier.clone(),
-          previous_nv,
-          GraphPathResolutionMode::OptionalPeers,
-        );
-        self.pending_unresolved_nodes.push_back(new_path);
-        return Ok(None);
-      }
+      // don't re-resolve a peer dependency when only going through the graph
+      // resolving optional peers
+      let node = self.graph.nodes.get(&ancestor_path.node_id()).unwrap();
+      let previous_id = node.children.get(&peer_dep.bare_specifier).unwrap();
+      let new_path = ancestor_path.with_id(
+        *previous_id,
+        peer_dep.bare_specifier.clone(),
+        previous_nv,
+        GraphPathResolutionMode::OptionalPeers,
+      );
+      self.pending_unresolved_nodes.push_back(new_path);
+      return Ok(None);
     }
 
     // the current dependency might have had the peer dependency
@@ -1444,20 +1537,18 @@ impl<'a, TNpmRegistryApi: NpmRegistryApi>
             continue;
           };
 
-          if let Some(id) = self.graph.resolved_node_ids.get(node_id) {
-            if id.nv == ancestor_path.nv {
-              if let Some(node_id) = node.children.get(specifier).copied() {
-                let peer_parent =
-                  GraphPathNodeOrRoot::Node(ancestor_path.clone());
-                self.set_new_peer_dep(
-                  &[ancestor_path],
-                  peer_parent,
-                  specifier,
-                  node_id,
-                );
-                return Ok(Some(node_id));
-              }
-            }
+          if let Some(id) = self.graph.resolved_node_ids.get(node_id)
+            && id.nv == ancestor_path.nv
+            && let Some(node_id) = node.children.get(specifier).copied()
+          {
+            let peer_parent = GraphPathNodeOrRoot::Node(ancestor_path.clone());
+            self.set_new_peer_dep(
+              &[ancestor_path],
+              peer_parent,
+              specifier,
+              node_id,
+            );
+            return Ok(Some(node_id));
           }
 
           for child_id in node.children.values().copied() {
@@ -1930,13 +2021,15 @@ fn build_trace_graph_snapshot(
 #[cfg(test)]
 mod test {
   use std::borrow::Cow;
+  use std::sync::Arc;
 
   use pretty_assertions::assert_eq;
 
+  use crate::NpmSystemInfo;
   use crate::registry::NpmDependencyEntryErrorSource;
   use crate::registry::TestNpmRegistryApi;
+  use crate::resolution::NpmPackageVersionNotFound;
   use crate::resolution::SerializedNpmResolutionSnapshot;
-  use crate::NpmSystemInfo;
 
   use super::*;
 
@@ -2049,6 +2142,25 @@ mod test {
     assert_eq!(
       package_reqs,
       vec![("package-a@1.0".to_string(), "package-a@1.0.0".to_string())]
+    );
+  }
+
+  #[tokio::test]
+  async fn skips_bundle_dependencies() {
+    let api = TestNpmRegistryApi::default();
+    api.ensure_package_version("package-a", "1.0.0");
+    api.ensure_package_version("package-b", "1.0.0");
+    api.add_bundle_dependency(("package-a", "1.0.0"), ("package-b", "1"));
+
+    let (packages, _package_reqs) =
+      run_resolver_and_get_output(api, vec!["package-a@1.0"]).await;
+    assert_eq!(
+      packages,
+      vec![TestNpmResolutionPackage {
+        pkg_id: "package-a@1.0.0".to_string(),
+        copy_index: 0,
+        dependencies: BTreeMap::new(),
+      },]
     );
   }
 
@@ -2403,7 +2515,7 @@ mod test {
     api.add_peer_dependency(("package-c", "3.0.0"), ("package-peer", "1"));
 
     let (packages, package_reqs) =
-      run_resolver_with_patch_packages_and_get_output(
+      run_resolver_with_link_packages_and_get_output(
         api,
         RunResolverOptions {
           reqs: vec!["package-0@1.1.1"],
@@ -4603,7 +4715,8 @@ mod test {
         ..Default::default()
       },
     )
-    .await;
+    .await
+    .unwrap();
     let (packages, package_reqs) = snapshot_to_packages(snapshot.clone());
     assert_eq!(
       packages,
@@ -4704,7 +4817,8 @@ mod test {
         ..Default::default()
       },
     )
-    .await;
+    .await
+    .unwrap();
     let (packages, package_reqs) = snapshot_to_packages(snapshot.clone());
     assert_eq!(packages, b_c_packages);
     assert_eq!(
@@ -4728,7 +4842,8 @@ mod test {
         ..Default::default()
       },
     )
-    .await;
+    .await
+    .unwrap();
     let (packages, package_reqs) = snapshot_to_packages(snapshot.clone());
     let mut d_packages = b_c_packages;
     d_packages.insert(
@@ -4795,7 +4910,7 @@ mod test {
   }
 
   #[tokio::test]
-  async fn patch_packages() {
+  async fn link_packages() {
     let api = TestNpmRegistryApi::default();
     api.ensure_package_version("package-a", "1.0.0");
     api.ensure_package_version("package-b1", "1.0.0");
@@ -4806,7 +4921,7 @@ mod test {
     api.add_dependency(("package-b1", "1.0.0"), ("package-b2", "1"));
     api.add_dependency(("package-c", "1.0.0"), ("package-d", "1"));
 
-    let patch_packages = HashMap::from([(
+    let link_packages = HashMap::from([(
       PackageName::from_static("package-b1"),
       vec![
         NpmPackageVersionInfo {
@@ -4826,11 +4941,11 @@ mod test {
     )]);
 
     let (packages, package_reqs) =
-      run_resolver_with_patch_packages_and_get_output(
+      run_resolver_with_link_packages_and_get_output(
         api,
         RunResolverOptions {
           reqs: vec!["package-a@1.0.0"],
-          patch_packages: Some(&patch_packages),
+          link_packages: Some(&link_packages),
           ..Default::default()
         },
       )
@@ -4877,13 +4992,13 @@ mod test {
   }
 
   #[tokio::test]
-  async fn patch_package_tag() {
+  async fn link_package_tag() {
     let api = TestNpmRegistryApi::default();
     api.ensure_package_version("package-a", "1.0.0");
     api.ensure_package_version("package-b", "1.0.0");
     api.add_dist_tag("package-a", "next", "1.0.0");
 
-    let patch_packages = HashMap::from([(
+    let link_packages = HashMap::from([(
       PackageName::from_static("package-a"),
       vec![NpmPackageVersionInfo {
         version: Version::parse_standard("1.0.0").unwrap(),
@@ -4896,11 +5011,11 @@ mod test {
     )]);
 
     let (packages, package_reqs) =
-      run_resolver_with_patch_packages_and_get_output(
+      run_resolver_with_link_packages_and_get_output(
         api,
         RunResolverOptions {
           reqs: vec!["package-a@next"],
-          patch_packages: Some(&patch_packages),
+          link_packages: Some(&link_packages),
           ..Default::default()
         },
       )
@@ -4931,7 +5046,7 @@ mod test {
   }
 
   #[tokio::test]
-  async fn resolve_patch_copy_index() {
+  async fn resolve_link_copy_index() {
     let api = TestNpmRegistryApi::default();
     api.ensure_package_version("package-a", "1.0.0");
     api.ensure_package_version("package-b", "1.0.0");
@@ -4942,7 +5057,7 @@ mod test {
     api.add_dependency(("package-b", "1.0.0"), ("package-peer", "=1.1.0"));
     api.add_dependency(("package-c", "1.0.0"), ("package-a", "1"));
 
-    let patch_packages = HashMap::from([(
+    let link_packages = HashMap::from([(
       PackageName::from_static("package-a"),
       vec![NpmPackageVersionInfo {
         version: Version::parse_standard("1.0.0").unwrap(),
@@ -4955,11 +5070,11 @@ mod test {
     )]);
 
     let (packages, package_reqs) =
-      run_resolver_with_patch_packages_and_get_output(
+      run_resolver_with_link_packages_and_get_output(
         api,
         RunResolverOptions {
           reqs: vec!["package-a@1.0", "package-b@1.0"],
-          patch_packages: Some(&patch_packages),
+          link_packages: Some(&link_packages),
           ..Default::default()
         },
       )
@@ -5092,7 +5207,8 @@ mod test {
         ..Default::default()
       },
     )
-    .await;
+    .await
+    .unwrap();
     let (packages, package_reqs) = snapshot_to_packages(snapshot.clone());
     // not sure if this is exactly correct, but there are no duplicate packages
     let expected_packages = Vec::from([
@@ -5157,7 +5273,8 @@ mod test {
         ..Default::default()
       },
     )
-    .await;
+    .await
+    .unwrap();
     let (packages, package_reqs) = snapshot_to_packages(snapshot);
     assert_eq!(packages, expected_packages);
     assert_eq!(package_reqs, vec![(
@@ -5345,6 +5462,119 @@ mod test {
     ]);
   }
 
+  #[tokio::test]
+  async fn snapshot_version_missing_registry_force_reload() {
+    struct ReloadRegistry(RefCell<Vec<TestNpmRegistryApi>>);
+
+    #[async_trait::async_trait(?Send)]
+    impl NpmRegistryApi for ReloadRegistry {
+      async fn package_info(
+        &self,
+        name: &str,
+      ) -> Result<Arc<NpmPackageInfo>, NpmRegistryPackageInfoLoadError> {
+        let reg = self.0.borrow()[0].clone();
+        reg.package_info(name).await
+      }
+
+      fn mark_force_reload(&self) -> bool {
+        let mut regs = self.0.borrow_mut();
+        if regs.len() == 2 {
+          regs.remove(0);
+          true
+        } else {
+          false
+        }
+      }
+    }
+
+    let api = TestNpmRegistryApi::default();
+    api.ensure_package_version("package-a", "1.0.0");
+    api.ensure_package_version("package-b", "0.5.0");
+    api.ensure_package_version("package-b", "1.0.0");
+    api.ensure_package_version("package-c", "1.0.0");
+    api.add_dependency(("package-a", "1.0.0"), ("package-b", "1"));
+
+    let snapshot = run_resolver_with_options_and_get_snapshot(
+      &api,
+      RunResolverOptions {
+        reqs: Vec::from(["package-a@1"]),
+        ..Default::default()
+      },
+    )
+    .await
+    .unwrap();
+    let missing_api = TestNpmRegistryApi::default();
+    missing_api.ensure_package_version("package-a", "1.0.0");
+    missing_api.ensure_package_version("package-b", "0.5.0");
+    missing_api.ensure_package_version("package-c", "1.0.0");
+
+    let err = run_resolver_with_options_and_get_snapshot(
+      &missing_api,
+      RunResolverOptions {
+        snapshot: snapshot.clone(),
+        reqs: Vec::from(["package-c@1"]),
+        ..Default::default()
+      },
+    )
+    .await
+    .unwrap_err();
+    match err {
+      NpmResolutionError::Resolution(
+        NpmPackageVersionResolutionError::VersionNotFound(
+          NpmPackageVersionNotFound(nv),
+        ),
+      ) => {
+        assert_eq!(nv, PackageNv::from_str("package-b@1.0.0").unwrap());
+      }
+      _ => unreachable!(),
+    }
+
+    let reload_registry =
+      ReloadRegistry(RefCell::new(Vec::from([missing_api, api])));
+    let snapshot = run_resolver_with_options_and_get_snapshot(
+      &reload_registry,
+      RunResolverOptions {
+        snapshot,
+        reqs: Vec::from(["package-c@1"]),
+        ..Default::default()
+      },
+    )
+    .await
+    .unwrap();
+    assert_eq!(reload_registry.0.borrow().len(), 1); // ensure the reload happened
+    let (packages, package_reqs) = snapshot_to_packages(snapshot);
+    assert_eq!(
+      packages,
+      vec![
+        TestNpmResolutionPackage {
+          pkg_id: "package-a@1.0.0".to_string(),
+          copy_index: 0,
+          dependencies: BTreeMap::from([(
+            "package-b".to_string(),
+            "package-b@1.0.0".to_string(),
+          )])
+        },
+        TestNpmResolutionPackage {
+          pkg_id: "package-b@1.0.0".to_string(),
+          copy_index: 0,
+          dependencies: Default::default(),
+        },
+        TestNpmResolutionPackage {
+          pkg_id: "package-c@1.0.0".to_string(),
+          copy_index: 0,
+          dependencies: Default::default(),
+        },
+      ]
+    );
+    assert_eq!(
+      package_reqs,
+      vec![
+        ("package-a@1".to_string(), "package-a@1.0.0".to_string()),
+        ("package-c@1".to_string(), "package-c@1.0.0".to_string()),
+      ]
+    );
+  }
+
   #[derive(Debug, Clone, PartialEq, Eq)]
   struct TestNpmResolutionPackage {
     pub pkg_id: String,
@@ -5356,7 +5586,7 @@ mod test {
     api: TestNpmRegistryApi,
     reqs: Vec<&str>,
   ) -> (Vec<TestNpmResolutionPackage>, Vec<(String, String)>) {
-    run_resolver_with_patch_packages_and_get_output(
+    run_resolver_with_link_packages_and_get_output(
       api,
       RunResolverOptions {
         reqs,
@@ -5366,12 +5596,13 @@ mod test {
     .await
   }
 
-  async fn run_resolver_with_patch_packages_and_get_output(
+  async fn run_resolver_with_link_packages_and_get_output(
     api: TestNpmRegistryApi,
     options: RunResolverOptions<'_>,
   ) -> (Vec<TestNpmResolutionPackage>, Vec<(String, String)>) {
-    let snapshot =
-      run_resolver_with_options_and_get_snapshot(&api, options).await;
+    let snapshot = run_resolver_with_options_and_get_snapshot(&api, options)
+      .await
+      .unwrap();
     snapshot_to_packages(snapshot)
   }
 
@@ -5449,27 +5680,27 @@ mod test {
       &api,
       RunResolverOptions {
         reqs,
-        patch_packages: None,
+        link_packages: None,
         snapshot: Default::default(),
         expected_diagnostics: Default::default(),
       },
     )
     .await
+    .unwrap()
   }
 
   #[derive(Default)]
   struct RunResolverOptions<'a> {
     snapshot: NpmResolutionSnapshot,
     reqs: Vec<&'a str>,
-    patch_packages:
-      Option<&'a HashMap<PackageName, Vec<NpmPackageVersionInfo>>>,
+    link_packages: Option<&'a HashMap<PackageName, Vec<NpmPackageVersionInfo>>>,
     expected_diagnostics: Vec<&'a str>,
   }
 
   async fn run_resolver_with_options_and_get_snapshot(
-    api: &TestNpmRegistryApi,
+    api: &impl NpmRegistryApi,
     options: RunResolverOptions<'_>,
-  ) -> NpmResolutionSnapshot {
+  ) -> Result<NpmResolutionSnapshot, NpmResolutionError> {
     fn snapshot_to_serialized(
       snapshot: &NpmResolutionSnapshot,
     ) -> SerializedNpmResolutionSnapshot {
@@ -5480,25 +5711,28 @@ mod test {
 
     let snapshot = options.snapshot;
     let mut graph = Graph::from_snapshot(snapshot);
-    let patch_packages = options
-      .patch_packages
+    let link_packages = options
+      .link_packages
       .map(Cow::Borrowed)
       .unwrap_or(Cow::Owned(HashMap::default()));
     let npm_version_resolver = NpmVersionResolver {
       types_node_version_req: None,
-      patch_packages: &patch_packages,
+      link_packages: &link_packages,
     };
-    let mut resolver =
-      GraphDependencyResolver::new(&mut graph, api, &npm_version_resolver);
+    let mut resolver = GraphDependencyResolver::new(
+      &mut graph,
+      api,
+      &npm_version_resolver,
+      None,
+    );
 
     for req in options.reqs {
       let req = PackageReq::from_str(req).unwrap();
       resolver
-        .add_package_req(&req, &api.package_info(&req.name).await.unwrap())
-        .unwrap();
+        .add_package_req(&req, &api.package_info(&req.name).await.unwrap())?;
     }
 
-    resolver.resolve_pending().await.unwrap();
+    resolver.resolve_pending().await?;
     {
       let diagnostics = resolver.take_unmet_peer_diagnostics();
       let diagnostics = diagnostics
@@ -5519,12 +5753,11 @@ mod test {
         .collect::<Vec<_>>();
       assert_eq!(diagnostics, options.expected_diagnostics);
     }
-    let snapshot = graph.into_snapshot(api, &patch_packages).await.unwrap();
+    let snapshot = graph.into_snapshot(api, &link_packages).await?;
 
     {
       let graph = Graph::from_snapshot(snapshot.clone());
-      let new_snapshot =
-        graph.into_snapshot(api, &patch_packages).await.unwrap();
+      let new_snapshot = graph.into_snapshot(api, &link_packages).await?;
       assert_eq!(
         snapshot_to_serialized(&snapshot),
         snapshot_to_serialized(&new_snapshot),
@@ -5532,8 +5765,7 @@ mod test {
       );
       // create one again from the new snapshot
       let graph = Graph::from_snapshot(new_snapshot.clone());
-      let new_snapshot2 =
-        graph.into_snapshot(api, &patch_packages).await.unwrap();
+      let new_snapshot2 = graph.into_snapshot(api, &link_packages).await?;
       assert_eq!(
         snapshot_to_serialized(&snapshot),
         snapshot_to_serialized(&new_snapshot2),
@@ -5541,7 +5773,7 @@ mod test {
       );
     }
 
-    snapshot
+    Ok(snapshot)
   }
 
   async fn run_resolver_and_get_error(
@@ -5552,10 +5784,14 @@ mod test {
     let mut graph = Graph::from_snapshot(snapshot);
     let npm_version_resolver = NpmVersionResolver {
       types_node_version_req: None,
-      patch_packages: &Default::default(),
+      link_packages: &Default::default(),
     };
-    let mut resolver =
-      GraphDependencyResolver::new(&mut graph, &api, &npm_version_resolver);
+    let mut resolver = GraphDependencyResolver::new(
+      &mut graph,
+      &api,
+      &npm_version_resolver,
+      None,
+    );
 
     for req in reqs {
       let req = PackageReq::from_str(req).unwrap();

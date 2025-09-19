@@ -62,49 +62,49 @@ impl NpmRc {
           if let Key::Plain(key) = &kv.key {
             if let Some((left, right)) = key.rsplit_once(':') {
               if let Some(scope) = left.strip_prefix('@') {
-                if right == "registry" {
-                  if let Value::String(text) = &kv.value {
-                    let value = expand_vars(text, get_env_var);
-                    scope_registries.insert(scope.to_string(), value);
-                  }
-                }
-              } else if let Some(host_and_path) = left.strip_prefix("//") {
-                if let Value::String(text) = &kv.value {
+                if right == "registry"
+                  && let Value::String(text) = &kv.value
+                {
                   let value = expand_vars(text, get_env_var);
-                  let config = registry_configs
-                    .entry(host_and_path.to_string())
-                    .or_default();
-                  match right {
-                    "_auth" => {
-                      config.auth = Some(value);
-                    }
-                    "_authToken" => {
-                      config.auth_token = Some(value);
-                    }
-                    "username" => {
-                      config.username = Some(value);
-                    }
-                    "_password" => {
-                      config.password = Some(value);
-                    }
-                    "email" => {
-                      config.email = Some(value);
-                    }
-                    "certfile" => {
-                      config.certfile = Some(value);
-                    }
-                    "keyfile" => {
-                      config.keyfile = Some(value);
-                    }
-                    _ => {}
+                  scope_registries.insert(scope.to_string(), value);
+                }
+              } else if let Some(host_and_path) = left.strip_prefix("//")
+                && let Value::String(text) = &kv.value
+              {
+                let value = expand_vars(text, get_env_var);
+                let config = registry_configs
+                  .entry(host_and_path.to_string())
+                  .or_default();
+                match right {
+                  "_auth" => {
+                    config.auth = Some(value);
                   }
+                  "_authToken" => {
+                    config.auth_token = Some(value);
+                  }
+                  "username" => {
+                    config.username = Some(value);
+                  }
+                  "_password" => {
+                    config.password = Some(value);
+                  }
+                  "email" => {
+                    config.email = Some(value);
+                  }
+                  "certfile" => {
+                    config.certfile = Some(value);
+                  }
+                  "keyfile" => {
+                    config.keyfile = Some(value);
+                  }
+                  _ => {}
                 }
               }
-            } else if key == "registry" {
-              if let Value::String(text) = &kv.value {
-                let value = expand_vars(text, get_env_var);
-                registry = Some(value);
-              }
+            } else if key == "registry"
+              && let Value::String(text) = &kv.value
+            {
+              let value = expand_vars(text, get_env_var);
+              registry = Some(value);
             }
           }
         }
@@ -294,11 +294,11 @@ fn expand_vars(
   input: &str,
   get_env_var: &impl Fn(&str) -> Option<String>,
 ) -> String {
-  fn escaped_char(input: &str) -> ParseResult<char> {
+  fn escaped_char(input: &str) -> ParseResult<'_, char> {
     preceded(ch('\\'), next_char)(input)
   }
 
-  fn env_var(input: &str) -> ParseResult<&str> {
+  fn env_var(input: &str) -> ParseResult<'_, &str> {
     let (input, _) = tag("${")(input)?;
     let (input, var_name) = take_while(|c| c != '}')(input)?;
     if var_name.chars().any(|c| matches!(c, '$' | '{' | '\\')) {

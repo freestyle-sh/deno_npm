@@ -7,13 +7,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use deno_semver::npm::NpmVersionReqParseError;
-use deno_semver::package::PackageName;
-use deno_semver::package::PackageNv;
 use deno_semver::SmallStackString;
 use deno_semver::StackString;
 use deno_semver::Version;
 use deno_semver::VersionReq;
+use deno_semver::npm::NpmVersionReqParseError;
+use deno_semver::package::PackageName;
+use deno_semver::package::PackageNv;
 use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
@@ -34,9 +34,9 @@ impl NpmPackageInfo {
   pub fn version_info<'a>(
     &'a self,
     nv: &PackageNv,
-    patched_packages: &'a HashMap<PackageName, Vec<NpmPackageVersionInfo>>,
+    link_packages: &'a HashMap<PackageName, Vec<NpmPackageVersionInfo>>,
   ) -> Result<&'a NpmPackageVersionInfo, NpmPackageVersionNotFound> {
-    if let Some(packages) = patched_packages.get(&nv.name) {
+    if let Some(packages) = link_packages.get(&nv.name) {
       for pkg in packages {
         if pkg.version == nv.version {
           return Ok(pkg);
@@ -139,32 +139,40 @@ pub enum NpmPackageVersionBinEntry {
 #[serde(rename_all = "camelCase")]
 pub struct NpmPackageVersionInfo {
   pub version: Version,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   pub dist: Option<NpmPackageVersionDistInfo>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   pub bin: Option<NpmPackageVersionBinEntry>,
   // Bare specifier to version (ex. `"typescript": "^3.0.1") or possibly
   // package and version (ex. `"typescript-3.0.1": "npm:typescript@3.0.1"`).
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "HashMap::is_empty")]
   #[serde(deserialize_with = "deserializers::hashmap")]
   pub dependencies: HashMap<StackString, StackString>,
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  #[serde(
+    deserialize_with = "deserializers::vector",
+    alias = "bundledDependencies"
+  )]
+  pub bundle_dependencies: Vec<StackString>,
+  #[serde(default, skip_serializing_if = "HashMap::is_empty")]
   #[serde(deserialize_with = "deserializers::hashmap")]
   pub optional_dependencies: HashMap<StackString, StackString>,
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "HashMap::is_empty")]
   #[serde(deserialize_with = "deserializers::hashmap")]
   pub peer_dependencies: HashMap<StackString, StackString>,
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "HashMap::is_empty")]
   #[serde(deserialize_with = "deserializers::hashmap")]
   pub peer_dependencies_meta: HashMap<StackString, NpmPeerDependencyMeta>,
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
   #[serde(deserialize_with = "deserializers::vector")]
   pub os: Vec<SmallStackString>,
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
   #[serde(deserialize_with = "deserializers::vector")]
   pub cpu: Vec<SmallStackString>,
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "HashMap::is_empty")]
   #[serde(deserialize_with = "deserializers::hashmap")]
   pub scripts: HashMap<SmallStackString, String>,
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   #[serde(deserialize_with = "deserializers::string")]
   pub deprecated: Option<String>,
 }
@@ -213,6 +221,7 @@ impl NpmPackageVersionInfo {
       .optional_dependencies
       .keys()
       .all(|k| self.dependencies.contains_key(k))
+      && self.bundle_dependencies.is_empty()
     {
       Cow::Borrowed(&self.dependencies)
     } else {
@@ -225,6 +234,8 @@ impl NpmPackageVersionInfo {
           .iter()
           // prefer what's in the dependencies map
           .chain(self.dependencies.iter())
+          // exclude bundle dependencies
+          .filter(|(k, _)| !self.bundle_dependencies.contains(k))
           .map(|(k, v)| (k.clone(), v.clone()))
           .collect(),
       )
@@ -313,7 +324,7 @@ pub enum NpmPackageVersionDistInfoIntegrity<'a> {
 }
 
 impl NpmPackageVersionDistInfoIntegrity<'_> {
-  pub fn for_lockfile(&self) -> Option<Cow<str>> {
+  pub fn for_lockfile(&self) -> Option<Cow<'_, str>> {
     match self {
       NpmPackageVersionDistInfoIntegrity::Integrity {
         algorithm,
@@ -334,12 +345,14 @@ impl NpmPackageVersionDistInfoIntegrity<'_> {
 pub struct NpmPackageVersionDistInfo {
   /// URL to the tarball.
   pub tarball: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   pub(crate) shasum: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   pub(crate) integrity: Option<String>,
 }
 
 impl NpmPackageVersionDistInfo {
-  pub fn integrity(&self) -> NpmPackageVersionDistInfoIntegrity {
+  pub fn integrity(&self) -> NpmPackageVersionDistInfoIntegrity<'_> {
     match &self.integrity {
       Some(integrity) => match integrity.split_once('-') {
         Some((algorithm, base64_hash)) => {
@@ -422,13 +435,13 @@ impl deno_lockfile::NpmPackageInfoProvider for TestNpmRegistryApi {
     Box<dyn std::error::Error + Send + Sync>,
   > {
     let mut infos = Vec::new();
-    let patched_packages = HashMap::new();
+    let linked_packages = HashMap::new();
     for nv in values {
       let info = self
         .package_info(nv.name.as_str())
         .await
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-      let version_info = info.version_info(nv, &patched_packages).unwrap();
+      let version_info = info.version_info(nv, &linked_packages).unwrap();
       let lockfile_info = deno_lockfile::Lockfile5NpmInfo {
         tarball_url: version_info
           .dist
@@ -438,8 +451,8 @@ impl deno_lockfile::NpmPackageInfoProvider for TestNpmRegistryApi {
         cpu: version_info.cpu.iter().map(|s| s.to_string()).collect(),
         os: version_info.os.iter().map(|s| s.to_string()).collect(),
         deprecated: version_info.deprecated.is_some(),
-        has_bin: version_info.bin.is_some(),
-        has_scripts: version_info.scripts.contains_key("preinstall")
+        bin: version_info.bin.is_some(),
+        scripts: version_info.scripts.contains_key("preinstall")
           || version_info.scripts.contains_key("install")
           || version_info.scripts.contains_key("postinstall"),
         optional_peers: version_info
@@ -550,6 +563,17 @@ impl TestNpmRegistryApi {
     })
   }
 
+  pub fn add_bundle_dependency(
+    &self,
+    package: (&str, &str),
+    entry: (&str, &str),
+  ) {
+    self.with_version_info(package, |version| {
+      version.dependencies.insert(entry.0.into(), entry.1.into());
+      version.bundle_dependencies.push(entry.0.into());
+    })
+  }
+
   pub fn add_dep_and_optional_dep(
     &self,
     package: (&str, &str),
@@ -619,13 +643,13 @@ mod deserializers {
   use std::collections::HashMap;
   use std::fmt;
 
+  use serde::Deserialize;
+  use serde::Deserializer;
   use serde::de;
   use serde::de::DeserializeOwned;
   use serde::de::MapAccess;
   use serde::de::SeqAccess;
   use serde::de::Visitor;
-  use serde::Deserialize;
-  use serde::Deserializer;
 
   /// Deserializes empty or null values to the default value (npm allows uploading
   /// `null` for values and serde doesn't automatically make that the default).
@@ -850,6 +874,13 @@ mod deserializers {
     {
       Ok(Some(v.to_string()))
     }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+      E: de::Error,
+    {
+      Ok(None)
+    }
   }
 
   struct VectorVisitor<T> {
@@ -942,6 +973,13 @@ mod deserializers {
     }
 
     fn visit_str<E>(self, _v: &str) -> Result<Self::Value, E>
+    where
+      E: de::Error,
+    {
+      Ok(Vec::new())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
     where
       E: de::Error,
     {
@@ -1282,5 +1320,75 @@ mod test {
         _ => unreachable!(),
       }
     }
+  }
+
+  #[test]
+  fn example_deserialization_fail() {
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct SerializedCachedPackageInfo {
+      #[serde(flatten)]
+      pub info: NpmPackageInfo,
+      /// Custom property that includes the etag.
+      #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "_denoETag"
+      )]
+      pub etag: Option<String>,
+    }
+
+    let text = r#"{
+      "name": "ts-morph",
+      "versions": {
+        "10.0.2": {
+          "version": "10.0.2",
+          "dist": {
+            "tarball": "https://registry.npmjs.org/ts-morph/-/ts-morph-10.0.2.tgz",
+            "shasum": "292418207db467326231b2be92828b5e295e7946",
+            "integrity": "sha512-TVuIfEqtr9dW25K3Jajqpqx7t/zLRFxKu2rXQZSDjTm4MO4lfmuj1hn8WEryjeDDBFcNOCi+yOmYUYR4HucrAg=="
+          },
+          "bin": null,
+          "dependencies": {
+            "code-block-writer": "^10.1.1",
+            "@ts-morph/common": "~0.9.0"
+          },
+          "deprecated": null
+        }
+      },
+      "dist-tags": { "rc": "2.0.4-rc", "latest": "25.0.1" }
+    }"#;
+    let result = serde_json::from_str::<SerializedCachedPackageInfo>(text);
+    assert!(result.is_ok());
+  }
+
+  #[test]
+  fn minimize_serialization_version_info() {
+    let data = NpmPackageVersionInfo {
+      version: Version::parse_from_npm("1.0.0").unwrap(),
+      dist: Default::default(),
+      bin: Default::default(),
+      dependencies: Default::default(),
+      bundle_dependencies: Default::default(),
+      optional_dependencies: Default::default(),
+      peer_dependencies: Default::default(),
+      peer_dependencies_meta: Default::default(),
+      os: Default::default(),
+      cpu: Default::default(),
+      scripts: Default::default(),
+      deprecated: Default::default(),
+    };
+    let text = serde_json::to_string(&data).unwrap();
+    assert_eq!(text, r#"{"version":"1.0.0"}"#);
+  }
+
+  #[test]
+  fn minimize_serialization_dist() {
+    let data = NpmPackageVersionDistInfo {
+      tarball: "test".to_string(),
+      shasum: None,
+      integrity: None,
+    };
+    let text = serde_json::to_string(&data).unwrap();
+    assert_eq!(text, r#"{"tarball":"test"}"#);
   }
 }

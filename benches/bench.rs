@@ -132,14 +132,14 @@ impl NpmRegistryApi for TargetFolderCachedRegistryApi {
       return Ok(data);
     }
     let file_path = packument_cache_filepath(name);
-    if let Ok(data) = std::fs::read_to_string(&file_path) {
-      if let Ok(data) = serde_json::from_str::<Arc<NpmPackageInfo>>(&data) {
-        self
-          .data
-          .borrow_mut()
-          .insert(name.to_string(), data.clone());
-        return Ok(data);
-      }
+    if let Ok(data) = std::fs::read_to_string(&file_path)
+      && let Ok(data) = serde_json::from_str::<Arc<NpmPackageInfo>>(&data)
+    {
+      self
+        .data
+        .borrow_mut()
+        .insert(name.to_string(), data.clone());
+      return Ok(data);
     }
     let url = packument_url(name);
     eprintln!("Downloading {}", url);
@@ -195,8 +195,9 @@ async fn run_resolver_and_get_snapshot(
       AddPkgReqsOptions {
         package_reqs: &reqs,
         types_node_version_req: None,
-        patch_packages: &Default::default(),
+        link_packages: &Default::default(),
       },
+      None,
     )
     .await;
   result.dep_graph_result.unwrap()

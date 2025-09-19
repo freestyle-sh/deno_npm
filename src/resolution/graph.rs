@@ -22,6 +22,8 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use thiserror::Error;
 
+use crate::arc::*;
+
 use super::common::NpmPackageVersionResolutionError;
 use crate::NpmResolutionPackageSystemInfo;
 use crate::registry::NpmDependencyEntry;
